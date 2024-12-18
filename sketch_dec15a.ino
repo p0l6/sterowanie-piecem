@@ -6,18 +6,19 @@
 #define EEPROM_SIZE 4
 #define GPIO_UP 25
 #define GPIO_DOWN 26
+#define GPIO_ACTIVATE 27 
+#define GPIO_HEATING 32
 
 const char* ssid = "Piec_Controller";
 const char* password = "12345678";
 
 WebServer server(80);
 
-float lastTemperature = 60.0; 
+float lastTemperature = 60.0;
 bool heating = false;
 unsigned long heatingStartTime = 0;
-unsigned long heatingDuration = 0; 
-std::vector<std::pair<float, unsigned long>> programs; 
-
+unsigned long heatingDuration = 0;
+std::vector<std::pair<float, unsigned long>> programs;
 
 String htmlPage() {
     String html = R"rawliteral(
@@ -35,10 +36,10 @@ String htmlPage() {
     <body>
         <h1>Sterowanie Piecem</h1>
         <h3>Ostatnia zapisana temperatura: <span id="lastTemp"></span> stopni</h3>
-        <h3>Pozostaly czas: <span id="remainingTime"></span> (Aktualna temperatura: <span id="currentTemp"></span> stopni)</h3>
+        <h3>Pozostaly czas: <span id="remainingTime"></span> (Aktualna ustawiona temperatura: <span id="currentTemp"></span> stopni)</h3>
         <div id="programContainer">
             <div class="program">
-                <input type="number" placeholder="Temperatura (stopni)" id="tempInput" step="5" min="5">
+                <input type="number" placeholder="Temperatura (stopni)" id="tempInput" step="1">
                 <input type="time" id="timeInput">
                 <button onclick="addProgram()">Dodaj</button>
             </div>
@@ -77,7 +78,7 @@ String htmlPage() {
                 const programContainer = document.getElementById('programContainer');
                 programContainer.innerHTML = 
                     `<div class="program">
-                        <input type="number" placeholder="Temperatura (stopni)" id="tempInput" step="5" min="5">
+                        <input type="number" placeholder="Temperatura (stopni)" id="tempInput" step="1">
                         <input type="time" id="timeInput">
                         <button onclick="addProgram()">Dodaj</button>
                     </div>`;
@@ -137,40 +138,57 @@ String htmlPage() {
     return html;
 }
 
+void adjustTemperature(float targetTemperature) {
+    float difference = targetTemperature - lastTemperature;
+    int steps = abs(difference);
+    bool increase = difference > 0;
+
+    digitalWrite(GPIO_ACTIVATE, HIGH);
+    delay(100); 
+
+    for (int i = 0; i < steps; i++) {
+        if (increase) {
+            digitalWrite(GPIO_UP, HIGH);
+            delay(100); 
+            digitalWrite(GPIO_UP, LOW);
+        } else {
+            digitalWrite(GPIO_DOWN, HIGH);
+            delay(100); 
+            digitalWrite(GPIO_DOWN, LOW);
+        }
+        delay(100); 
+    }
+
+    digitalWrite(GPIO_ACTIVATE, LOW);
+
+    lastTemperature = targetTemperature;
+    EEPROM.put(0, lastTemperature);
+    EEPROM.commit();
+
+    Serial.println("Temperatura ustawiona na: " + String(targetTemperature) + " stopni.");
+}
+
+void startHeating(float targetTemperature, unsigned long duration) {
+    if (lastTemperature != targetTemperature) {
+        adjustTemperature(targetTemperature);
+    }
+
+    digitalWrite(GPIO_HEATING, HIGH);  
+    heating = true;
+    heatingStartTime = millis();
+    heatingDuration = duration;
+
+    Serial.println("Piec uruchomiony: " + String(targetTemperature) + " stopni na " + String(duration / 1000) + " sekund.");
+}
 
 void stopHeating() {
-    digitalWrite(GPIO_UP, LOW);  
+    digitalWrite(GPIO_HEATING, LOW);  
     heating = false;
     heatingDuration = 0;
 
     Serial.println("Piec zatrzymany.");
 }
 
-void handleProgramStop() {
-    stopHeating();
-    server.send(200, "text/plain", "Piec zatrzymany");
-}
-
-unsigned long parseTime(const String& timeStr) {
-    int hours, minutes;
-    if (sscanf(timeStr.c_str(), "%d:%d", &hours, &minutes) == 2) {
-        return (hours * 3600 + minutes * 60) * 1000;
-    }
-    return 0;
-}
-
-void startHeating(float targetTemperature, unsigned long duration) {
-    digitalWrite(GPIO_UP, HIGH);  
-    heating = true;
-    heatingStartTime = millis();
-    heatingDuration = duration;
-
-    lastTemperature = targetTemperature;
-    EEPROM.put(0, lastTemperature);
-    EEPROM.commit();
-
-    Serial.println("Piec uruchomiony: " + String(targetTemperature) + " stopni na " + String(duration / 1000) + " sekund.");
-}
 
 void startNextProgram() {
     if (!programs.empty()) {
@@ -178,8 +196,12 @@ void startNextProgram() {
         unsigned long duration = programs[0].second;
         programs.erase(programs.begin());
         startHeating(targetTemp, duration);
+    } else {
+        stopHeating();
+        Serial.println("Program zakonczony.");
     }
 }
+
 
 void handleProgramStart() {
     if (server.hasArg("plain")) {
@@ -190,6 +212,7 @@ void handleProgramStart() {
             server.send(400, "text/plain", "Blad parsowania JSON");
             return;
         }
+
         programs.clear();
         JsonArray arr = doc.as<JsonArray>();
         for (JsonObject obj : arr) {
@@ -203,15 +226,32 @@ void handleProgramStart() {
     }
 }
 
+
+void handleProgramStop() {
+    stopHeating();
+    server.send(200, "text/plain", "Piec zatrzymany");
+}
+
+
 void handleRemainingTime() {
     if (heating) {
         unsigned long remaining = heatingDuration - (millis() - heatingStartTime);
         server.send(200, "application/json", "{\"remaining_time\": " + String(remaining) +
                                               ", \"current_temp\": " + String(lastTemperature) + "}");
     } else {
-        server.send(200, "application/json", "{\"remaining_time\": 0, \"current_temp\": 0}");
+        server.send(200, "application/json", "{\"remaining_time\": 0, \"current_temp\": " + String(lastTemperature) + "}");
     }
 }
+
+
+unsigned long parseTime(const String& timeStr) {
+    int hours, minutes;
+    if (sscanf(timeStr.c_str(), "%d:%d", &hours, &minutes) == 2) {
+        return (hours * 3600 + minutes * 60) * 1000;
+    }
+    return 0;
+}
+
 
 void setup() {
     Serial.begin(115200);
@@ -219,8 +259,12 @@ void setup() {
 
     pinMode(GPIO_UP, OUTPUT);
     pinMode(GPIO_DOWN, OUTPUT);
+    pinMode(GPIO_ACTIVATE, OUTPUT);
+    pinMode(GPIO_HEATING, OUTPUT);
     digitalWrite(GPIO_UP, LOW);   
     digitalWrite(GPIO_DOWN, LOW);
+    digitalWrite(GPIO_ACTIVATE, LOW);
+    digitalWrite(GPIO_HEATING, LOW);
 
     EEPROM.get(0, lastTemperature);
 
@@ -239,6 +283,7 @@ void setup() {
     server.begin();
     Serial.println("Serwer uruchomiony.");
 }
+
 
 void loop() {
     server.handleClient();
